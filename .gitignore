@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+data/
+third_party/
+runs/
+results/
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.npz
+*.log
+.DS_Store
