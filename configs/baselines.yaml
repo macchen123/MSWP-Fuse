@@ -1,0 +1,111 @@
+models:
+  Persistence:
+    display_name: Persistence
+    kind: persistence
+    horizon: 96
+
+  DLinear:
+    display_name: DLinear-NWP
+    kind: tslib
+    architecture:
+      task_name: long_term_forecast
+      features: S
+      seq_len: 672
+      label_len: 48
+      pred_len: 96
+      enc_in: 1
+      dec_in: 1
+      c_out: 1
+      d_model: 512
+      n_heads: 8
+      e_layers: 2
+      d_layers: 1
+      d_ff: 2048
+      moving_avg: 25
+      factor: 3
+      dropout: 0.1
+      embed: timeF
+      freq: t
+      activation: gelu
+      individual: false
+    training: {optimizer: Adam, learning_rate: 0.0001, weight_decay: 0.0, schedule: type1, epochs: 10, batch_size: 32, use_amp: false}
+
+  LightGBM:
+    display_name: LightGBM-NWP
+    kind: tree
+    estimator: lightgbm
+    training: {seed: 42, n_jobs: 8, n_estimators: 100, deterministic: true}
+
+  XGBoost:
+    display_name: XGBoost-NWP
+    kind: tree
+    estimator: xgboost
+    training: {seed: 42, n_jobs: 8, n_estimators: 100, tree_method: hist}
+
+  NWPSeq2Seq:
+    display_name: NWP-GRU Seq2Seq
+    kind: native
+    architecture: {history_steps: 672, pred_len: 96, nwp_channels: 27, availability_channels: 3, hidden: 128, layers: 2, dropout: 0.1}
+    training: {optimizer: AdamW, learning_rate: 0.0002, weight_decay: 0.0005, betas: [0.9, 0.95], schedule: five_epoch_linear_warmup_then_cosine, warmup_epochs: 5, minimum_lr: 0.00001, epochs: 80, batch_size: 32, gradient_clip: 1.0, use_amp: false}
+
+  TemporalFusionTransformer:
+    display_name: Temporal Fusion Transformer-NWP
+    kind: tft
+    architecture:
+      encoder_length: 672
+      pred_len: 96
+      hidden_size: 16
+      attention_head_size: 1
+      lstm_layers: 1
+      hidden_continuous_size: 8
+      dropout: 0.1
+      output_size: 7
+      quantiles: [0.02, 0.1, 0.25, 0.5, 0.75, 0.9, 0.98]
+      point_forecast_quantile: 0.5
+    training: {optimizer: Adam, learning_rate: 0.03, weight_decay: 0.0, schedule: none_validation_scheduler_removed, epochs: 100, batch_size: 64, gradient_clip: 0.1, use_amp: false}
+
+  PatchTST:
+    display_name: PatchTST-NWP
+    kind: tslib
+    architecture: {task_name: long_term_forecast, features: S, seq_len: 672, label_len: 48, pred_len: 96, enc_in: 1, dec_in: 1, c_out: 1, d_model: 512, n_heads: 8, e_layers: 2, d_layers: 1, d_ff: 2048, factor: 3, dropout: 0.1, embed: timeF, freq: t, activation: gelu, patch_len: 16, stride: 8}
+    training: {optimizer: Adam, learning_rate: 0.0001, weight_decay: 0.0, schedule: type1, epochs: 10, batch_size: 16, use_amp: false}
+
+  iTransformer:
+    display_name: iTransformer-NWP
+    kind: tslib
+    architecture: {task_name: long_term_forecast, features: S, seq_len: 672, label_len: 48, pred_len: 96, enc_in: 1, dec_in: 1, c_out: 1, d_model: 512, n_heads: 8, e_layers: 3, d_layers: 1, d_ff: 512, factor: 3, dropout: 0.1, embed: timeF, freq: t, activation: gelu, use_norm: 1}
+    training: {optimizer: Adam, learning_rate: 0.0005, weight_decay: 0.0, schedule: type1, epochs: 10, batch_size: 16, use_amp: false}
+
+  TimeMixer:
+    display_name: TimeMixer-NWP
+    kind: tslib
+    architecture: {task_name: long_term_forecast, features: S, seq_len: 672, label_len: 0, pred_len: 96, enc_in: 1, dec_in: 1, c_out: 1, d_model: 16, n_heads: 8, e_layers: 3, d_layers: 1, d_ff: 32, factor: 3, dropout: 0.1, embed: timeF, freq: t, activation: gelu, moving_avg: 25, channel_independence: 1, decomp_method: moving_avg, use_norm: 1, down_sampling_layers: 3, down_sampling_window: 2, down_sampling_method: avg, top_k: 5}
+    training: {optimizer: Adam, learning_rate: 0.01, weight_decay: 0.0, schedule: type1, epochs: 20, batch_size: 32, use_amp: false}
+
+  TimeXer:
+    display_name: TimeXer-NWP
+    kind: tslib
+    architecture: {task_name: long_term_forecast, features: MS, seq_len: 672, label_len: 48, pred_len: 96, enc_in: 6, dec_in: 6, c_out: 1, d_model: 512, n_heads: 8, e_layers: 1, d_layers: 1, d_ff: 2048, factor: 3, dropout: 0.1, embed: timeF, freq: t, activation: gelu, patch_len: 16, use_norm: 1}
+    training: {optimizer: Adam, learning_rate: 0.0001, weight_decay: 0.0, schedule: type1, epochs: 10, batch_size: 4, use_amp: false}
+
+  WPMixer:
+    display_name: WPMixer-NWP
+    kind: tslib
+    architecture: {task_name: long_term_forecast, features: S, seq_len: 512, history_steps: 672, history_slice: last_512_steps, label_len: 0, pred_len: 96, enc_in: 1, dec_in: 1, c_out: 1, d_model: 32, dropout: 0.1, patch_len: 16, stride: 8, wavelet: sym3, level: 2, tfactor: 3, dfactor: 5}
+    training: {optimizer: Adam, learning_rate: 0.00328086, weight_decay: 0.0, schedule: type3, epochs: 100, batch_size: 32, use_amp: true}
+
+  MultiPatchFormer:
+    display_name: MultiPatchFormer-NWP
+    kind: tslib
+    architecture: {task_name: long_term_forecast, features: S, seq_len: 96, history_steps: 672, history_adapter: seven_nonoverlapping_daily_segments_then_mean, label_len: 48, pred_len: 96, enc_in: 1, dec_in: 1, c_out: 1, d_model: 256, n_heads: 8, e_layers: 1, d_layers: 1, d_ff: 512, factor: 1, dropout: 0.1, embed: timeF, freq: t, activation: gelu}
+    training: {optimizer: Adam, learning_rate: 0.0001, weight_decay: 0.0, schedule: type1, epochs: 10, batch_size: 32, use_amp: false}
+
+nwp_adapter:
+  hidden_size: 64
+  dropout: 0.1
+  residual_scale: 1.0
+  output_initialization: zero
+
+upstreams:
+  time_series_library_commit: 4e938a1767106324dd753b2a44832bf870a0252e
+  pytorch_forecasting_commit: 4d8d97cd3e85a15a9b90a38dfb0afc819d8e8aa4

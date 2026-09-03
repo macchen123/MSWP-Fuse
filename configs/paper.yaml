@@ -1,0 +1,88 @@
+data:
+  default_root: data/raw_data
+  history_steps: 672
+  forecast_steps: 96
+  station_ids: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+  resources:
+    wind: [1, 2, 3, 4, 5]
+    solar: [6, 7, 8, 9, 10]
+  nwp:
+    providers: [NWP_1, NWP_2, NWP_3]
+    channels: [ghi, poai, pressure, t2m, tcc, tp, u100, v100, wind_speed]
+    channel_mapping:
+      NWP_1: {ghi: ghi, poai: poai, pressure: sp, t2m: t2m, tcc: tcc, tp: tp, u100: u100, v100: v100}
+      NWP_2: {ghi: ghi, poai: poai, pressure: msl, t2m: t2m, tcc: tcc, tp: tp, u100: u100, v100: v100}
+      NWP_3: {ghi: ghi, poai: poai, pressure: sp, t2m: t2m, tcc: tcc, tp: tp, u100: u100, v100: v100}
+
+folds:
+  summer:
+    train: [2024-01-08, 2024-05-31]
+    validation: [2024-06-01, 2024-06-30]
+    test: [2024-07-01, 2024-08-31]
+  autumn:
+    train: [2024-01-08, 2024-07-31]
+    validation: [2024-08-01, 2024-08-31]
+    test: [2024-09-01, 2024-10-31]
+  early_winter:
+    train: [2024-01-08, 2024-09-30]
+    validation: [2024-10-01, 2024-10-31]
+    test: [2024-11-01, 2024-12-31]
+
+model:
+  d_model: 128
+  n_heads: 4
+  d_ff: 512
+  history_layers: 2
+  history_patch_length: 8
+  history_patch_stride: 8
+  lag_hidden: 64
+  provider_heads: 4
+  horizon_head_rank: 16
+  dropout: 0.10
+  use_refiner: true
+  temporal_hidden: 24
+  interaction_rank: 12
+  bounded_scale_maximum: 0.15
+  initial_scale_fraction: 0.4125854203825821
+  initial_inactive_bias: -6.0
+  initial_correction_gate_bias: -4.0
+
+selected_training:
+  seed: 17
+  trainable_scope: amendment_plus_head
+  parent_lr_multiplier: 0.03
+  learning_rate: 0.0009636214210166788
+  weight_decay: 0.001
+  warmup_epochs: 1
+  source_dropout_start_epoch: 3
+  source_dropout_probability: 0.15
+  minimum_lr: 0.000001
+  gradient_clip: 2.0
+  dates_per_batch: 4
+  inactive_bce: 0.010234056831462461
+  suppression_budget: 0.0001
+  correction_budget: 0.0001
+  activity_threshold: 0.04
+  loss_shares:
+    station_macro_c: 0.60
+    charbonnier_mae: 0.15
+    pooled_rmse: 0.25
+  max_epochs: 60
+  patience: 10
+  checkpoint_c_tolerance: 0.0001
+  checkpoint_tie_breakers: [rmse, mae, earlier_epoch]
+
+parent_stage:
+  epochs: 18
+  learning_rate: 0.0003
+  weight_decay: 0.0002
+  warmup_epochs: 2
+  minimum_lr: 0.00001
+  gradient_clip: 1.0
+  dates_per_batch: 4
+  source_dropout_start_epoch: 3
+  source_dropout_probability: 0.05
+  loss_shares:
+    station_macro_c: 0.50
+    charbonnier_mae: 0.30
+    pooled_rmse: 0.20
