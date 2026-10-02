@@ -3,22 +3,26 @@
 from __future__ import annotations
 
 import math
+import os
 import random
 import time
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import torch
 from torch import Tensor, nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 from .losses import CompositeForecastLoss, GradientBalance, calibrate_gradient_weights, masked_mean, valid_mask
 from .metrics import compute_metrics
-from .model import AMENDMENT_PREFIXES, MSWPFuse
+from .model import AMENDMENT_PREFIXES, MSWPFuse, MSWPFuseBackbone
 
 
 @dataclass(frozen=True)
@@ -104,12 +108,28 @@ def seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    torch.use_deterministic_algorithms(True, warn_only=True)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
     if torch.backends.mps.is_available():
         torch.mps.manual_seed(seed)
+
+
+def seed_mswpfuse(seed: int, device: torch.device) -> None:
+    seed_everything(seed)
+    torch.use_deterministic_algorithms(True)
+    torch.set_num_threads(2 if device.type == "cpu" else 1)
+    if device.type == "cuda":
+        if os.environ.get("CUBLAS_WORKSPACE_CONFIG") != ":4096:8":
+            raise RuntimeError("Set CUBLAS_WORKSPACE_CONFIG=:4096:8 before starting CUDA")
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+
+
+def training_attention_context(device: torch.device):
+    return sdpa_kernel(SDPBackend.MATH) if device.type == "cuda" else nullcontext()
 
 
 def move_batch(batch: Mapping[str, object], device: torch.device) -> dict[str, object]:
@@ -359,6 +379,17 @@ def _is_better(candidate: Mapping[str, float], incumbent: Mapping[str, float] | 
     return (candidate["rmse"], candidate["mae"], candidate["epoch"]) < (incumbent["rmse"], incumbent["mae"], incumbent["epoch"])
 
 
+def select_validation_row(rows: Sequence[Mapping[str, Any]], tolerance: float = 0.0001) -> Mapping[str, Any]:
+    """Resolve ties against the maximum C, not against a drifting incumbent."""
+    if not rows:
+        raise ValueError("No validation checkpoints are available")
+    if any(not all(math.isfinite(float(row[key])) for key in ("c", "rmse", "mae")) for row in rows):
+        raise ValueError("Validation selection requires finite metrics")
+    maximum = max(float(row["c"]) for row in rows)
+    eligible = [row for row in rows if float(row["c"]) >= maximum - tolerance]
+    return min(eligible, key=lambda row: (float(row["rmse"]), float(row["mae"]), int(row["epoch"]), int(row.get("configuration", 0))))
+
+
 def train_selected(
     model: MSWPFuse,
     train_dataset: Dataset[Any],
@@ -366,10 +397,9 @@ def train_selected(
     settings: Mapping[str, Any],
     device: torch.device,
 ) -> TrainingOutcome:
-    """Train the selected amendment-plus-head configuration."""
-
+    """Train one candidate; validation alone chooses its adaptation checkpoint."""
     seed = int(settings["seed"])
-    seed_everything(seed)
+    seed_mswpfuse(seed, device)
     model.to(device)
     balance = selected_gradient_balance(train_dataset, settings)
     composite = CompositeForecastLoss(balance.weights).to(device)
@@ -377,24 +407,23 @@ def train_selected(
     optimizer = AdamW(groups, betas=(0.9, 0.95), eps=1.0e-8)
     loader, sampler = complete_date_loader(train_dataset, int(settings["dates_per_batch"]), seed, True)
     max_epochs = int(settings["max_epochs"])
-    patience = int(settings["patience"])
     tolerance = float(settings["checkpoint_c_tolerance"])
-    best: dict[str, float] | None = None
-    best_state: dict[str, Tensor] | None = None
+    saved: list[tuple[dict[str, Any], dict[str, Tensor]]] = []
+    highest = -math.inf
+    last_best = None
     stale = 0
     history: list[dict[str, float | int]] = []
     started = time.perf_counter()
-
     for epoch in range(1, max_epochs + 1):
         sampler.set_epoch(epoch)
         model.set_source_dropout(0.0 if epoch < int(settings["source_dropout_start_epoch"]) else float(settings["source_dropout_probability"]))
         _set_learning_rates(optimizer, epoch, max_epochs, int(settings["warmup_epochs"]))
         model.train()
-        total_loss = 0.0
-        batches = 0
+        losses = []
         for batch in loader:
             device_batch = move_batch(batch, device)
-            states = model.forward_features(forecast_inputs(device_batch))
+            with training_attention_context(device):
+                states = model.forward_features(forecast_inputs(device_batch))
             loss = _selected_loss(model, states, device_batch, composite, settings)
             if not bool(torch.isfinite(loss)):
                 raise FloatingPointError(f"Non-finite selected loss at epoch {epoch}")
@@ -403,98 +432,168 @@ def train_selected(
             trainable = [value for value in model.parameters() if value.requires_grad]
             nn.utils.clip_grad_norm_(trainable, float(settings["gradient_clip"]), error_if_nonfinite=True)
             optimizer.step()
-            total_loss += float(loss.detach().cpu())
-            batches += 1
-        validation = collect_predictions(model, validation_dataset, device)
-        metrics = validation.metrics()
+            losses.append(float(loss.detach().cpu()))
+        model.set_source_dropout(0.0)
+        metrics = collect_predictions(model, validation_dataset, device, batch_size=40).metrics()
         if metrics["mae"] is None or metrics["rmse"] is None:
             raise FloatingPointError("Validation contains non-finite predictions")
-        candidate = {"epoch": float(epoch), "c": float(metrics["c"]), "mae": float(metrics["mae"]), "rmse": float(metrics["rmse"])}
-        history.append({"epoch": epoch, "train_loss": total_loss / max(1, batches), "c": candidate["c"], "mae": candidate["mae"], "rmse": candidate["rmse"], "learning_rate": float(optimizer.param_groups[0]["lr"])})
-        if _is_better(candidate, best, tolerance):
-            best = candidate
-            best_state = cpu_state_dict(model)
-            stale = 0
-        else:
-            stale += 1
-        if stale >= patience:
+        row = {"epoch": epoch, "c": float(metrics["c"]), "mae": float(metrics["mae"]), "rmse": float(metrics["rmse"])}
+        history.append({**row, "train_loss": float(np.mean(losses)), "learning_rate": float(optimizer.param_groups[0]["lr"])})
+        highest = max(highest, row["c"])
+        saved = [(record, state) for record, state in saved if record["c"] >= highest - tolerance]
+        if row["c"] >= highest - tolerance:
+            saved.append((row, cpu_state_dict(model)))
+        best = select_validation_row([record for record, _ in saved], tolerance)
+        stale = stale + 1 if best["epoch"] == last_best else 0
+        last_best = best["epoch"]
+        if stale >= int(settings["patience"]):
             break
-    if best is None or best_state is None:
-        raise RuntimeError("Selected training did not produce a checkpoint")
+    best = select_validation_row([record for record, _ in saved], tolerance)
+    best_state = next(state for record, state in saved if record is best)
     model.load_state_dict(best_state, strict=True)
     return TrainingOutcome(
-        best_epoch=int(best["epoch"]),
-        best_c=best["c"],
-        best_mae=best["mae"],
-        best_rmse=best["rmse"],
-        elapsed_seconds=time.perf_counter() - started,
-        history=tuple(history),
-        state_dict=best_state,
-        gradient_balance=balance,
+        best_epoch=int(best["epoch"]), best_c=float(best["c"]),
+        best_mae=float(best["mae"]), best_rmse=float(best["rmse"]),
+        elapsed_seconds=time.perf_counter() - started, history=tuple(history),
+        state_dict=best_state, gradient_balance=balance,
     )
 
 
+def parent_parameter_groups(model: MSWPFuseBackbone, settings: Mapping[str, Any]) -> list[dict[str, Any]]:
+    transferred = {f"patch_history.{name}" for name in model.loaded_history_keys}
+    groups: dict[str, dict[str, Any]] = {}
+    for name, parameter in model.named_parameters():
+        parameter.requires_grad_(True)
+        leaf = name.rsplit(".", 1)[-1]
+        no_decay = leaf in {"bias", "in_proj_bias"} or "norm" in name.lower() or "embedding" in name.lower()
+        if name in transferred:
+            group_name = "transferred_history_no_decay" if no_decay else "transferred_history_weights"
+            lr = float(settings["transferred_learning_rate"])
+            decay = 0.0 if no_decay else float(settings["transferred_weight_decay"])
+        elif name == "conditioner.station_delta.weight":
+            group_name, lr, decay = "station_delta", float(settings["station_learning_rate"]), 0.0
+        elif no_decay:
+            group_name, lr, decay = "normalization_bias_and_base_embeddings", float(settings["learning_rate"]), 0.0
+        else:
+            group_name, lr, decay = "new_weights", float(settings["learning_rate"]), float(settings["weight_decay"])
+        group = groups.setdefault(group_name, {"params": [], "lr": lr, "base_lr": lr, "weight_decay": decay, "name": group_name})
+        group["params"].append(parameter)
+    return list(groups.values())
+
+
 def train_parent(
-    model: MSWPFuse,
+    model: MSWPFuseBackbone,
     train_dataset: Dataset[Any],
     selected_settings: Mapping[str, Any],
     parent_settings: Mapping[str, Any],
     device: torch.device,
 ) -> TrainingOutcome:
-    """Train the public parent path before the selected amendment stage."""
-
+    """Fit the initialized backbone for the fixed 18-epoch schedule."""
+    if not model.loaded_history_keys:
+        raise ValueError("Backbone training requires the same-fold history initializer")
     seed = int(selected_settings["seed"])
-    seed_everything(seed)
+    seed_mswpfuse(seed, device)
     model.to(device)
-    for name, parameter in model.named_parameters():
-        parameter.requires_grad_(not name.startswith(AMENDMENT_PREFIXES))
     balance = gradient_balance(train_dataset, parent_settings["loss_shares"])
     composite = CompositeForecastLoss(balance.weights).to(device)
-    parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
-    learning_rate = float(parent_settings["learning_rate"])
-    minimum_lr = float(parent_settings["minimum_lr"])
-    optimizer = AdamW(
-        [{"params": parameters, "lr": learning_rate, "base_lr": learning_rate, "minimum_lr": minimum_lr, "weight_decay": float(parent_settings["weight_decay"])}],
-        betas=(0.9, 0.95),
-        eps=1.0e-8,
-    )
+    optimizer = AdamW(parent_parameter_groups(model, parent_settings), betas=(0.9, 0.95), eps=1.0e-8)
     loader, sampler = complete_date_loader(train_dataset, int(parent_settings["dates_per_batch"]), seed, True)
     max_epochs = int(parent_settings["epochs"])
+    warmup = int(parent_settings["warmup_epochs"])
+    scheduler = CosineAnnealingLR(optimizer, T_max=max(1, max_epochs - warmup), eta_min=float(parent_settings["minimum_lr"]))
     history: list[dict[str, float | int]] = []
     started = time.perf_counter()
     for epoch in range(1, max_epochs + 1):
         sampler.set_epoch(epoch)
+        for name, parameter in model.patch_history.named_parameters():
+            if name in model.loaded_history_keys:
+                parameter.requires_grad_(epoch > int(parent_settings["history_freeze_epochs"]))
         model.set_source_dropout(0.0 if epoch < int(parent_settings["source_dropout_start_epoch"]) else float(parent_settings["source_dropout_probability"]))
-        _set_learning_rates(optimizer, epoch, max_epochs, int(parent_settings["warmup_epochs"]))
+        if epoch <= warmup:
+            for group in optimizer.param_groups:
+                group["lr"] = float(group["base_lr"]) * epoch / max(1, warmup)
         model.train()
-        total_loss = 0.0
-        batches = 0
+        losses = []
         for batch in loader:
             device_batch = move_batch(batch, device)
-            prediction = model.forward_parent(forecast_inputs(device_batch))
-            target = device_batch["target"]
-            mask = device_batch["target_valid_mask"]
-            station_ids = device_batch["original_station_id"]
-            if not all(isinstance(value, Tensor) for value in (target, mask, station_ids)):
-                raise TypeError("Training labels must be tensors")
-            loss = composite(prediction, target.float(), station_ids, mask.bool(), model.station_delta_penalty())
+            prediction = model(forecast_inputs(device_batch))
+            loss = composite(prediction.float(), device_batch["target"].float(), device_batch["original_station_id"], device_batch["target_valid_mask"].bool(), model.station_delta_penalty())
             if not bool(torch.isfinite(loss)):
                 raise FloatingPointError(f"Non-finite parent loss at epoch {epoch}")
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            nn.utils.clip_grad_norm_(parameters, float(parent_settings["gradient_clip"]), error_if_nonfinite=True)
+            nn.utils.clip_grad_norm_([value for value in model.parameters() if value.requires_grad], float(parent_settings["gradient_clip"]), error_if_nonfinite=True)
             optimizer.step()
-            total_loss += float(loss.detach().cpu())
-            batches += 1
-        history.append({"epoch": epoch, "train_loss": total_loss / max(1, batches), "learning_rate": float(optimizer.param_groups[0]["lr"])})
-    state = cpu_state_dict(model)
+            losses.append(float(loss.detach().cpu()))
+        if epoch > warmup:
+            scheduler.step()
+        history.append({"epoch": epoch, "train_loss": float(np.mean(losses)), "learning_rate": float(optimizer.param_groups[0]["lr"])})
     return TrainingOutcome(
-        best_epoch=max_epochs,
-        best_c=None,
-        best_mae=None,
-        best_rmse=None,
-        elapsed_seconds=time.perf_counter() - started,
-        history=tuple(history),
-        state_dict=state,
-        gradient_balance=balance,
+        best_epoch=max_epochs, best_c=None, best_mae=None, best_rmse=None,
+        elapsed_seconds=time.perf_counter() - started, history=tuple(history),
+        state_dict=cpu_state_dict(model), gradient_balance=balance,
+    )
+
+
+def train_initializer(
+    model: nn.Module,
+    train_dataset: Dataset[Any],
+    validation_dataset: Dataset[Any],
+    settings: Mapping[str, Any],
+    device: torch.device,
+) -> TrainingOutcome:
+    """Fit the full initializer with station-day MAE and validation-C stopping."""
+    seed = int(settings["seed"])
+    seed_everything(seed)
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision(str(settings["float32_matmul_precision"]))
+    model.to(device)
+    loader = regular_loader(train_dataset, int(settings["batch_size"]), True, seed)
+    optimizer = AdamW(model.parameters(), lr=float(settings["learning_rate"]), weight_decay=float(settings["weight_decay"]), betas=(0.9, 0.95))
+    max_epochs, warmup = int(settings["max_epochs"]), int(settings["warmup_epochs"])
+    scheduler = CosineAnnealingLR(optimizer, T_max=max(1, max_epochs - warmup), eta_min=float(settings["minimum_lr"]))
+    best = None
+    best_state = None
+    stale = 0
+    history = []
+    started = time.perf_counter()
+    for epoch in range(1, max_epochs + 1):
+        if epoch <= warmup:
+            for group in optimizer.param_groups:
+                group["lr"] = float(settings["learning_rate"]) * epoch / max(1, warmup)
+        model.train()
+        losses = []
+        for batch in loader:
+            batch = move_batch(batch, device)
+            prediction = model(forecast_inputs(batch))
+            mask = batch["target_valid_mask"].bool()
+            daily = torch.where(mask, (prediction - batch["target"]).abs(), 0.0).sum(dim=1) / mask.sum(dim=1).clamp_min(1)
+            loss = daily[mask.any(dim=1)].mean()
+            if not bool(torch.isfinite(loss)):
+                raise FloatingPointError(f"Non-finite initializer loss at epoch {epoch}")
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), float(settings["gradient_clip"]))
+            optimizer.step()
+            losses.append(float(loss.detach().cpu()))
+        if epoch > warmup:
+            scheduler.step()
+        metrics = collect_predictions(model, validation_dataset, device, batch_size=int(settings["batch_size"])).metrics()
+        if metrics["mae"] is None or metrics["rmse"] is None:
+            raise FloatingPointError("Initializer validation contains non-finite predictions")
+        row = {"epoch": epoch, "c": float(metrics["c"]), "mae": float(metrics["mae"]), "rmse": float(metrics["rmse"])}
+        history.append({**row, "train_loss": float(np.mean(losses)), "learning_rate": float(optimizer.param_groups[0]["lr"])})
+        if _is_better(row, best, float(settings["checkpoint_c_tolerance"])):
+            best, best_state, stale = row, cpu_state_dict(model), 0
+        else:
+            stale += 1
+        if stale >= int(settings["patience"]):
+            break
+    if best is None or best_state is None:
+        raise RuntimeError("Initializer training did not produce a checkpoint")
+    model.load_state_dict(best_state, strict=True)
+    return TrainingOutcome(
+        best_epoch=int(best["epoch"]), best_c=best["c"], best_mae=best["mae"], best_rmse=best["rmse"],
+        elapsed_seconds=time.perf_counter() - started, history=tuple(history), state_dict=best_state,
     )

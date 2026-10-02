@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib
-import math
 import pickle
 import subprocess
 import sys
@@ -25,7 +24,14 @@ from torch.utils.data import Dataset
 import yaml
 
 from .data import NWPScaler
-from .training import PredictionBundle, collect_predictions, forecast_inputs, move_batch, regular_loader, seed_everything
+from .training import (
+    PredictionBundle,
+    collect_predictions,
+    forecast_inputs,
+    move_batch,
+    regular_loader,
+    seed_everything,
+)
 
 TSLIB_MODELS = {
     "DLinear": "DLinear",
@@ -156,8 +162,6 @@ class NWPSeq2Seq(nn.Module):
 
 
 class TSLibAdapter(nn.Module):
-    uses_nwp = True
-
     def __init__(
         self,
         name: str,
@@ -176,12 +180,16 @@ class TSLibAdapter(nn.Module):
         construction_device = torch.device("cpu") if name == "WPMixer" and device.type == "mps" else device
         self.config = _tslib_config(name, self.architecture, construction_device, batch_size)
         self.model = module.Model(self.config)
-        adapter = load_baseline_settings()["nwp_adapter"]
-        self.nwp_adapter = FutureNWPResidual(
-            hidden_size=int(adapter["hidden_size"]),
-            dropout=float(adapter["dropout"]),
-            residual_scale=float(adapter["residual_scale"]),
-        )
+        self.uses_nwp = bool(self.architecture.get("use_nwp_adapter", self.name != "TimeMixer"))
+        if self.uses_nwp:
+            adapter = load_baseline_settings()["nwp_adapter"]
+            self.nwp_adapter: FutureNWPResidual | None = FutureNWPResidual(
+                hidden_size=int(adapter["hidden_size"]),
+                dropout=float(adapter["dropout"]),
+                residual_scale=float(adapter["residual_scale"]),
+            )
+        else:
+            self.nwp_adapter = None
 
     def forward(self, batch: Mapping[str, Tensor]) -> Tensor:
         power = batch["hist_power"][:, :, :1]
@@ -200,7 +208,9 @@ class TSLibAdapter(nn.Module):
         else:
             encoder = torch.cat([history_time, power], dim=-1) if self.name == "TimeXer" else power
             base = self._forecast(encoder, history_time, future_time)[:, :, -1]
-        return self.nwp_adapter(base, batch["nwp"], batch["nwp_availability"])
+        if self.nwp_adapter is not None:
+            return self.nwp_adapter(base, batch["nwp"], batch["nwp_availability"])
+        return base
 
     def _forecast(self, encoder: Tensor, history_time: Tensor, future_time: Tensor) -> Tensor:
         label_length = int(self.config.label_len)
@@ -296,7 +306,7 @@ class TemporalFusionTransformerAdapter(nn.Module):
             learning_rate=0.03,
             log_interval=-1,
             log_val_interval=-1,
-            reduce_on_plateau_patience=4,
+            reduce_on_plateau_patience=3,
         )
         package_path = Path(package.__file__ or "").resolve()
         if not package_path.is_relative_to(upstream):
@@ -478,25 +488,27 @@ def build_neural_baseline(
     name: str,
     device: torch.device,
     *,
+    architecture: Mapping[str, Any] | None = None,
     tslib_root: Path | str | None = None,
     pytorch_forecasting_root: Path | str | None = None,
 ) -> nn.Module:
     config = _configured_model(name)
     kind = config["kind"]
+    arch = dict(architecture) if architecture is not None else config.get("architecture", {})
     if kind == "persistence":
         model: nn.Module = Persistence()
     elif kind == "native":
-        model = NWPSeq2Seq(config["architecture"])
+        model = NWPSeq2Seq(arch)
     elif kind == "tslib":
         model = TSLibAdapter(
             name,
-            config["architecture"],
+            arch,
             tslib_root,
             device,
             int(config["training"]["batch_size"]),
         )
     elif kind == "tft":
-        model = TemporalFusionTransformerAdapter(config["architecture"], pytorch_forecasting_root)
+        model = TemporalFusionTransformerAdapter(arch, pytorch_forecasting_root)
     else:
         raise ValueError(f"{name} is not a neural baseline")
     return model.to(device)
@@ -511,6 +523,40 @@ def _adjust_tslib_learning_rate(optimizer: torch.optim.Optimizer, epoch: int, sc
     adjust(optimizer, epoch, SimpleNamespace(lradj=schedule, learning_rate=learning_rate))
 
 
+def _is_better_validation_c(
+    candidate_c: float,
+    candidate_rmse: float,
+    candidate_mae: float,
+    incumbent_c: float,
+    incumbent_rmse: float,
+    incumbent_mae: float,
+    tie_tolerance: float = 0.0001,
+) -> bool:
+    if not np.isfinite([candidate_c, candidate_rmse, candidate_mae]).all():
+        return False
+    if candidate_c > incumbent_c + tie_tolerance:
+        return True
+    if candidate_c < incumbent_c - tie_tolerance:
+        return False
+    return (candidate_rmse, candidate_mae) < (incumbent_rmse, incumbent_mae)
+
+
+def _is_better_validation_mae(
+    candidate_mae: float,
+    candidate_rmse: float,
+    incumbent_mae: float,
+    incumbent_rmse: float,
+    tie_tolerance: float = 0.0001,
+) -> bool:
+    if not np.isfinite([candidate_mae, candidate_rmse]).all():
+        return False
+    if candidate_mae < incumbent_mae - tie_tolerance:
+        return True
+    if candidate_mae > incumbent_mae + tie_tolerance:
+        return False
+    return candidate_rmse < incumbent_rmse
+
+
 def train_neural_baseline(
     name: str,
     model: nn.Module,
@@ -518,32 +564,96 @@ def train_neural_baseline(
     device: torch.device,
     seed: int,
     *,
+    validation_dataset: Dataset[Any] | None = None,
     tslib_root: Path | str | None = None,
+    pytorch_forecasting_root: Path | str | None = None,
 ) -> list[dict[str, float | int]]:
     config = _configured_model(name)
     if config["kind"] == "persistence":
         return []
+    if validation_dataset is None:
+        raise ValueError(f"{name} requires validation_dataset for validation-driven checkpoint selection")
+
     training = config["training"]
     seed_everything(seed)
+    torch.set_num_threads(2)
     model.to(device)
+
+    precision = "high" if name in {"NWPSeq2Seq", "TimeMixer"} else str(training.get("precision", "highest"))
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision(precision)
+
     optimizer_name = str(training["optimizer"])
-    if optimizer_name == "Adam":
-        optimizer: torch.optim.Optimizer = Adam(model.parameters(), lr=float(training["learning_rate"]), weight_decay=float(training["weight_decay"]))
-    elif optimizer_name == "AdamW":
-        optimizer = AdamW(model.parameters(), lr=float(training["learning_rate"]), weight_decay=float(training["weight_decay"]), betas=tuple(float(value) for value in training.get("betas", (0.9, 0.999))))
-    else:
-        raise ValueError(f"Unsupported optimizer: {optimizer_name}")
-    schedule = str(training["schedule"])
     epochs = int(training["epochs"])
     warmup = int(training.get("warmup_epochs", 0))
-    cosine = CosineAnnealingLR(optimizer, T_max=max(1, epochs - warmup), eta_min=float(training.get("minimum_lr", 1.0e-6))) if schedule == "five_epoch_linear_warmup_then_cosine" else None
+    schedule = str(training.get("schedule", "none"))
+
+    if name == "TemporalFusionTransformer":
+        model.model.hparams.update(
+            learning_rate=float(training["learning_rate"]),
+            weight_decay=float(training["weight_decay"]),
+            optimizer="adam",
+            reduce_on_plateau_patience=int(training.get("reduce_on_plateau_patience", 3)),
+        )
+        native = model.model.configure_optimizers()
+        optimizer: torch.optim.Optimizer = native["optimizer"]
+        tft_scheduler: Any = native["lr_scheduler"]["scheduler"]
+        cosine = None
+    elif optimizer_name == "Adam":
+        optimizer = Adam(
+            model.parameters(),
+            lr=float(training["learning_rate"]),
+            weight_decay=float(training["weight_decay"]),
+        )
+        tft_scheduler = None
+        cosine = (
+            CosineAnnealingLR(
+                optimizer,
+                T_max=max(1, epochs - warmup),
+                eta_min=float(training.get("minimum_lr", 1.0e-5)),
+            )
+            if schedule in {"cosine", "five_epoch_linear_warmup_then_cosine"}
+            else None
+        )
+    elif optimizer_name == "AdamW":
+        optimizer = AdamW(
+            model.parameters(),
+            lr=float(training["learning_rate"]),
+            weight_decay=float(training["weight_decay"]),
+            betas=tuple(float(value) for value in training.get("betas", (0.9, 0.95))),
+        )
+        tft_scheduler = None
+        cosine = (
+            CosineAnnealingLR(
+                optimizer,
+                T_max=max(1, epochs - warmup),
+                eta_min=float(training.get("minimum_lr", 1.0e-5)),
+            )
+            if schedule in {"cosine", "five_epoch_linear_warmup_then_cosine"}
+            else None
+        )
+    else:
+        raise ValueError(f"Unsupported optimizer: {optimizer_name}")
+
     use_amp = bool(training.get("use_amp", False)) and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if use_amp else None
+
     loader = regular_loader(dataset, int(training["batch_size"]), True, seed)
     history: list[dict[str, float | int]] = []
     native_loss = getattr(model, "native_training_loss", None)
+
+    best_state: dict[str, Tensor] | None = None
+    best_epoch = 0
+    best_loss = float("inf")
+    best_stopping_loss = float("inf")
+    best_mae = float("inf")
+    best_rmse = float("inf")
+    best_c = float("-inf")
+    stale_epochs = 0
+    patience = int(training.get("patience", 0))
+
     for epoch in range(1, epochs + 1):
-        if schedule == "five_epoch_linear_warmup_then_cosine" and epoch <= warmup:
+        if cosine is not None and epoch <= warmup:
             for group in optimizer.param_groups:
                 group["lr"] = float(training["learning_rate"]) * epoch / max(1, warmup)
         model.train()
@@ -554,7 +664,13 @@ def train_neural_baseline(
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
                 if callable(native_loss):
-                    loss = native_loss(forecast_inputs(device_batch))
+                    loss = native_loss(device_batch)
+                elif name == "TimeMixer":
+                    output = model(forecast_inputs(device_batch))
+                    target = device_batch["target"]
+                    if not isinstance(target, Tensor):
+                        raise TypeError("Training labels must be tensors")
+                    loss = (output - target).square().mean()
                 else:
                     output = model(forecast_inputs(device_batch))
                     target = device_batch["target"]
@@ -581,11 +697,133 @@ def train_neural_baseline(
                 scaler.update()
             total_loss += float(loss.detach().cpu())
             batches += 1
-        history.append({"epoch": epoch, "train_loss": total_loss / max(1, batches), "learning_rate": float(optimizer.param_groups[0]["lr"])})
+
+        history_record: dict[str, float | int] = {
+            "epoch": epoch,
+            "train_loss": total_loss / max(1, batches),
+            "learning_rate": float(optimizer.param_groups[0]["lr"]),
+        }
+
+        if name == "TimeMixer" or training.get("monitor") == "validation_mae":
+            validation = collect_predictions(model, validation_dataset, device, batch_size=int(training["batch_size"]))
+            error = validation.predictions.astype(np.float32) - validation.targets.astype(np.float32)
+            if not np.isfinite(error).all() or error.size == 0:
+                raise FloatingPointError("Validation predictions contain non-finite values or empty")
+            val_mae = float(np.mean(np.abs(error)))
+            val_rmse = float(np.sqrt(np.mean(np.square(error))))
+            is_improvement = _is_better_validation_mae(
+                val_mae,
+                val_rmse,
+                best_mae,
+                best_rmse,
+                tie_tolerance=float(training.get("tie_tolerance", 1e-4)),
+            )
+            if is_improvement:
+                best_mae = val_mae
+                best_rmse = val_rmse
+                best_epoch = epoch
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                stale_epochs = 0
+            else:
+                stale_epochs += 1
+            history_record["val_mae"] = val_mae
+            history_record["val_rmse"] = val_rmse
+        elif name == "NWPSeq2Seq" or training.get("monitor") in {"validation_C", "validation_c"}:
+            validation = collect_predictions(model, validation_dataset, device, batch_size=int(training["batch_size"]))
+            metrics = validation.metrics()
+            if metrics.get("c") is None or not np.isfinite(float(metrics["c"])):
+                raise FloatingPointError("Validation C is non-finite")
+            val_c = float(metrics["c"])
+            val_rmse = float(metrics["rmse"]) if metrics.get("rmse") is not None else float("inf")
+            val_mae = float(metrics["mae"]) if metrics.get("mae") is not None else float("inf")
+            tie_tol = float(training.get("tie_tolerance_absolute_c", 1e-4))
+            is_improvement = _is_better_validation_c(val_c, val_rmse, val_mae, best_c, best_rmse, best_mae, tie_tolerance=tie_tol)
+            if is_improvement:
+                best_c = val_c
+                best_rmse = val_rmse
+                best_mae = val_mae
+                best_epoch = epoch
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                stale_epochs = 0
+            else:
+                stale_epochs += 1
+            history_record["val_c"] = val_c
+            history_record["val_rmse"] = val_rmse
+            history_record["val_mae"] = val_mae
+        elif name == "TemporalFusionTransformer":
+            model.eval()
+            val_losses: list[float] = []
+            val_counts: list[int] = []
+            val_loader = regular_loader(validation_dataset, int(training["batch_size"]), False, seed)
+            with torch.no_grad():
+                for batch in val_loader:
+                    device_batch = move_batch(batch, device)
+                    loss = model.native_training_loss(device_batch)
+                    if not bool(torch.isfinite(loss)):
+                        raise FloatingPointError("Non-finite validation loss")
+                    val_losses.append(float(loss.detach().cpu()))
+                    val_counts.append(int(device_batch["target_valid_mask"].sum()))
+            if not val_losses:
+                raise ValueError("Validation dataset is empty")
+            val_loss = float(np.average(val_losses, weights=val_counts)) if val_counts and sum(val_counts) > 0 else float(np.mean(val_losses))
+            if val_loss < best_loss:
+                best_loss = val_loss
+                best_epoch = epoch
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            min_delta = float(training.get("min_delta", 1e-4))
+            if best_stopping_loss - val_loss > min_delta:
+                best_stopping_loss = val_loss
+                stale_epochs = 0
+            else:
+                stale_epochs += 1
+            if tft_scheduler is not None:
+                tft_scheduler.step(val_loss)
+            history_record["val_loss"] = val_loss
+        else:
+            model.eval()
+            val_losses = []
+            val_loader = regular_loader(validation_dataset, int(training["batch_size"]), False, seed)
+            with torch.no_grad():
+                for batch in val_loader:
+                    device_batch = move_batch(batch, device)
+                    with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
+                        inputs = forecast_inputs(device_batch)
+                        output = model(inputs)
+                        target = device_batch["target"]
+                        mask = device_batch["target_valid_mask"].bool()
+                        if not bool(mask.any()):
+                            continue
+                        loss = (output[mask] - target[mask]).square().mean()
+                    if not bool(torch.isfinite(loss)):
+                        raise FloatingPointError("Non-finite validation loss")
+                    val_losses.append(float(loss.detach().cpu()))
+            if not val_losses:
+                raise ValueError("Validation dataset is empty or has no valid targets")
+            val_loss = float(np.mean(val_losses))
+            if val_loss <= best_loss:
+                best_loss = val_loss
+                best_epoch = epoch
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                stale_epochs = 0
+            else:
+                stale_epochs += 1
+            history_record["val_loss"] = val_loss
+
+        history.append(history_record)
+
         if schedule in {"type1", "type3"}:
             _adjust_tslib_learning_rate(optimizer, epoch, schedule, float(training["learning_rate"]), tslib_root)
         elif cosine is not None and epoch > warmup:
             cosine.step()
+
+        if patience > 0 and stale_epochs >= patience:
+            break
+
+    if best_state is None:
+        raise RuntimeError(f"{name} training did not produce a valid checkpoint")
+    model.load_state_dict(best_state, strict=True)
+    model.to(device)
+
     return history
 
 
@@ -603,6 +841,7 @@ def train_baseline(
     device: torch.device,
     seed: int,
     *,
+    validation_dataset: Dataset[Any] | None = None,
     tslib_root: Path | str | None = None,
     pytorch_forecasting_root: Path | str | None = None,
 ) -> BaselineRun:
@@ -615,7 +854,17 @@ def train_baseline(
         history = ({"epoch": 1, "train_seconds": time.perf_counter() - started},)
     else:
         model = build_neural_baseline(name, device, tslib_root=tslib_root, pytorch_forecasting_root=pytorch_forecasting_root)
-        history = tuple(train_neural_baseline(name, model, dataset, device, seed, tslib_root=tslib_root))
+        history = tuple(
+            train_neural_baseline(
+                name,
+                model,
+                dataset,
+                device,
+                seed,
+                validation_dataset=validation_dataset,
+                tslib_root=tslib_root,
+            )
+        )
     return BaselineRun(name=name, kind=kind, model=model, history=history)
 
 
@@ -623,11 +872,35 @@ def save_baseline(path: Path | str, run: BaselineRun, scaler: NWPScaler) -> None
     path = Path(path)
     if run.kind == "tree":
         with path.open("wb") as handle:
-            pickle.dump({"name": run.name, "kind": run.kind, "model": run.model, "scaler": scaler.to_dict(), "history": list(run.history)}, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump(
+                {
+                    "name": run.name,
+                    "kind": run.kind,
+                    "model": run.model,
+                    "scaler": scaler.to_dict(),
+                    "history": list(run.history),
+                },
+                handle,
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
         return
     if not isinstance(run.model, nn.Module):
         raise TypeError("Neural baseline is not a torch module")
-    torch.save({"name": run.name, "kind": run.kind, "state_dict": {key: value.detach().cpu() for key, value in run.model.state_dict().items()}, "scaler": scaler.to_dict(), "history": list(run.history)}, path)
+    config = _configured_model(run.name)
+    precision = "high" if run.name in {"NWPSeq2Seq", "TimeMixer"} else str(config.get("training", {}).get("precision", "highest"))
+    torch.save(
+        {
+            "name": run.name,
+            "kind": run.kind,
+            "architecture": config.get("architecture"),
+            "training": dict(config.get("training", {})),
+            "float32_matmul_precision": precision,
+            "state_dict": {key: value.detach().cpu() for key, value in run.model.state_dict().items()},
+            "scaler": scaler.to_dict(),
+            "history": list(run.history),
+        },
+        path,
+    )
 
 
 def load_baseline(
@@ -645,11 +918,28 @@ def load_baseline(
             payload = pickle.load(handle)
         if payload.get("name") != name or payload.get("kind") != "tree":
             raise ValueError("Tree file does not match the requested baseline")
+        if "scaler" not in payload:
+            raise KeyError("Tree file missing required scaler mapping")
         return payload["model"], NWPScaler.from_dict(payload["scaler"]), "tree"
     payload = torch.load(path, map_location="cpu", weights_only=True)
     if payload.get("name") != name or payload.get("kind") != config["kind"]:
         raise ValueError("Checkpoint does not match the requested baseline")
-    model = build_neural_baseline(name, device, tslib_root=tslib_root, pytorch_forecasting_root=pytorch_forecasting_root)
+    if "scaler" not in payload:
+        raise KeyError("Checkpoint missing required scaler mapping")
+    if "state_dict" not in payload:
+        raise KeyError("Checkpoint missing state_dict")
+
+    precision = payload.get("float32_matmul_precision")
+    if precision and device.type == "cuda":
+        torch.set_float32_matmul_precision(precision)
+
+    model = build_neural_baseline(
+        name,
+        device,
+        architecture=payload.get("architecture"),
+        tslib_root=tslib_root,
+        pytorch_forecasting_root=pytorch_forecasting_root,
+    )
     model.load_state_dict(payload["state_dict"], strict=True)
     model.to(device).eval()
     return model, NWPScaler.from_dict(payload["scaler"]), str(config["kind"])

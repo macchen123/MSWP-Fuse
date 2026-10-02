@@ -48,7 +48,7 @@ model:
   initial_correction_gate_bias: -4.0
 
 selected_training:
-  seed: 17
+  seed: 42
   trainable_scope: amendment_plus_head
   parent_lr_multiplier: 0.03
   learning_rate: 0.0009636214210166788
@@ -86,3 +86,80 @@ parent_stage:
     station_macro_c: 0.50
     charbonnier_mae: 0.30
     pooled_rmse: 0.20
+  transferred_learning_rate: 0.00005
+  transferred_weight_decay: 0.0001
+  station_learning_rate: 0.0001
+  history_freeze_epochs: 3
+
+initializer_training:
+  seed: 42
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  batch_size: 32
+  max_epochs: 120
+  patience: 15
+  warmup_epochs: 8
+  minimum_lr: 0.00001
+  gradient_clip: 1.0
+  checkpoint_c_tolerance: 0.0001
+  float32_matmul_precision: high
+
+# Configuration numbers match the candidate tables in the Supporting Information.
+# Unspecified values inherit the shared model and selected_training settings above.
+configurations:
+  1: {}
+  2:
+    model: {temporal_hidden: 32, interaction_rank: 16, initial_scale_fraction: 0.4}
+    selected_training:
+      learning_rate: 0.0001
+      weight_decay: 0.0005
+      source_dropout_probability: 0.05
+      inactive_bce: 0.005
+      activity_threshold: 0.02
+      loss_shares: {station_macro_c: 0.50, charbonnier_mae: 0.30, pooled_rmse: 0.20}
+  3:
+    model: {interaction_rank: 16, bounded_scale_maximum: 0.20, initial_scale_fraction: 0.25, initial_inactive_bias: -4.0, initial_correction_gate_bias: -2.0}
+    selected_training:
+      learning_rate: 0.0001
+      parent_lr_multiplier: 0.01
+      weight_decay: 0.0001
+      source_dropout_probability: 0.10
+      gradient_clip: 1.0
+      inactive_bce: 0.010
+      activity_threshold: 0.02
+      loss_shares: {station_macro_c: 0.50, charbonnier_mae: 0.15, pooled_rmse: 0.35}
+  4:
+    model: {temporal_hidden: 32, initial_scale_fraction: 0.1, initial_inactive_bias: -4.0}
+    selected_training:
+      learning_rate: 0.0003
+      parent_lr_multiplier: 0.01
+      weight_decay: 0.0001
+      source_dropout_probability: 0.05
+      gradient_clip: 1.0
+      inactive_bce: 0.020
+      activity_threshold: 0.02
+  5:
+    model: {temporal_hidden: 16, interaction_rank: 8, bounded_scale_maximum: 0.20, initial_scale_fraction: 0.4, initial_inactive_bias: -5.0, initial_correction_gate_bias: -2.0}
+    selected_training:
+      learning_rate: 0.0001
+      parent_lr_multiplier: 0.10
+      weight_decay: 0.0001
+      source_dropout_probability: 0.05
+      gradient_clip: 1.0
+      inactive_bce: 0.050
+      loss_shares: {station_macro_c: 0.50, charbonnier_mae: 0.15, pooled_rmse: 0.35}
+  6:
+    model: {temporal_hidden: 32, interaction_rank: 16, initial_scale_fraction: 0.25, initial_correction_gate_bias: -2.0}
+    selected_training:
+      learning_rate: 0.0001
+      weight_decay: 0.0005
+      source_dropout_probability: 0.05
+      gradient_clip: 1.0
+      inactive_bce: 0.005
+      activity_threshold: 0.005
+      loss_shares: {station_macro_c: 0.50, charbonnier_mae: 0.15, pooled_rmse: 0.35}
+
+selected_configurations:
+  summer: 4
+  autumn: 1
+  early_winter: 1

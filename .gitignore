@@ -12,5 +12,14 @@ results/
 *.ckpt
 *.pkl
 *.npz
+*.npy
+*.nc
+*.csv
+*.parquet
+*.h5
+*.hdf5
+*.zip
+*.tar
+*.tar.gz
 *.log
 .DS_Store

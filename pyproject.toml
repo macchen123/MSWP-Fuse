@@ -19,6 +19,9 @@ dependencies = [
     "xgboost==3.3.0",
 ]
 
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
 [project.scripts]
 mswpfuse = "mswpfuse.cli:main"
 

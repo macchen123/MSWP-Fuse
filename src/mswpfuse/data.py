@@ -39,11 +39,20 @@ def package_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def load_paper_settings() -> dict[str, Any]:
+def load_paper_settings(fold: str | None = None, configuration: int | None = None) -> dict[str, Any]:
     path = package_root() / "configs" / "paper.yaml"
     value = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
         raise TypeError("paper.yaml must contain a mapping")
+    if fold is not None and fold not in value["folds"]:
+        raise KeyError(f"Unknown fold: {fold}")
+    if configuration is None:
+        configuration = int(value["selected_configurations"][fold]) if fold is not None else 1
+    if configuration not in value["configurations"]:
+        raise ValueError(f"Unknown configuration: {configuration}")
+    for section, overrides in value["configurations"][configuration].items():
+        value[section].update(overrides)
+    value["configuration"] = configuration
     return value
 
 
@@ -140,7 +149,7 @@ class NWPScaler:
 
 
 class RawDataStore:
-    """Reads the released CSV and NetCDF files without target-day imputation."""
+    """Reads authorized local CSV and NetCDF files, retaining raw target masks."""
 
     def __init__(self, root: Path | str):
         self.root = Path(root).expanduser()
@@ -178,6 +187,13 @@ class RawDataStore:
         if history_values.shape != (HISTORY_STEPS,) or target.shape != (FORECAST_STEPS,):
             raise ValueError(f"Unexpected power shape for {ref.key}")
         return history_values, target, raw_target, valid_target_mask
+
+    def processed_target(self, ref: SampleRef) -> np.ndarray:
+        """Historical target preprocessing used only by the transferred TimeMixer fit."""
+        index = pd.date_range(pd.Timestamp(ref.target_date), periods=FORECAST_STEPS, freq="15min")
+        series = self._power_series(ref.station_id)
+        filled = series.reindex(series.index.union(index)).sort_index().ffill()
+        return filled.reindex(index).fillna(0.0).clip(lower=0.0).to_numpy(np.float32)
 
     def nwp(self, ref: SampleRef) -> tuple[np.ndarray, np.ndarray]:
         key = (ref.station_id, ref.nwp_file_date)
@@ -258,10 +274,13 @@ class PowerNWPDataset(Dataset[dict[str, torch.Tensor | str]]):
         store: RawDataStore,
         scaler: NWPScaler,
         station_ids: Sequence[int] = STATION_IDS,
+        *,
+        processed_targets: bool = False,
     ):
         self.refs = tuple(refs)
         self.store = store
         self.scaler = scaler
+        self.processed_targets = bool(processed_targets)
         self.station_index = {station: index for index, station in enumerate(station_ids)}
         if tuple(station_ids) != STATION_IDS:
             raise ValueError("The public release uses stations 1 through 10 in order")
@@ -272,6 +291,8 @@ class PowerNWPDataset(Dataset[dict[str, torch.Tensor | str]]):
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
         ref = self.refs[index]
         history, target, raw_target, valid_target_mask = self.store.history_target(ref)
+        if self.processed_targets:
+            target = self.store.processed_target(ref)
         difference = np.zeros_like(history)
         difference[1:] = history[1:] - history[:-1]
         raw_nwp, availability = self.store.nwp(ref)
@@ -327,13 +348,22 @@ def interpolate_hourly_nwp(hourly: np.ndarray) -> np.ndarray:
     return result
 
 
-def build_references(start: date, end: date, station_ids: Sequence[int] = STATION_IDS) -> list[SampleRef]:
+def build_references(
+    start: date,
+    end: date,
+    station_ids: Sequence[int] = STATION_IDS,
+    *,
+    store: RawDataStore | None = None,
+) -> list[SampleRef]:
     if tuple(station_ids) != STATION_IDS:
         raise ValueError("The public release requires all ten stations")
     result: list[SampleRef] = []
     current = start
     while current <= end:
-        result.extend(SampleRef(station, current) for station in station_ids)
+        for station in station_ids:
+            ref = SampleRef(station, current)
+            if store is None or store.nwp_path(ref, "NWP_1").is_file():
+                result.append(ref)
         current += timedelta(days=1)
     return result
 
@@ -365,11 +395,13 @@ def fit_nwp_scaler(store: RawDataStore, refs: Iterable[SampleRef]) -> NWPScaler:
 def build_fold_datasets(
     data_root: Path | str,
     fold: str,
+    *,
+    processed_targets: bool = False,
 ) -> tuple[dict[str, PowerNWPDataset], NWPScaler]:
     store = RawDataStore(data_root)
-    refs = {name: build_references(*fold_dates(fold, name)) for name in ("train", "validation", "test")}
+    refs = {name: build_references(*fold_dates(fold, name), store=store) for name in ("train", "validation")}
     scaler = fit_nwp_scaler(store, refs["train"])
-    return {name: PowerNWPDataset(value, store, scaler) for name, value in refs.items()}, scaler
+    return {name: PowerNWPDataset(value, store, scaler, processed_targets=processed_targets) for name, value in refs.items()}, scaler
 
 
 def build_split_dataset(
@@ -379,4 +411,4 @@ def build_split_dataset(
     scaler: NWPScaler,
 ) -> PowerNWPDataset:
     store = RawDataStore(data_root)
-    return PowerNWPDataset(build_references(*fold_dates(fold, split)), store, scaler)
+    return PowerNWPDataset(build_references(*fold_dates(fold, split), store=store), store, scaler)
