@@ -12,7 +12,8 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from mswpfuse.cli import _load_model_checkpoint, _write_model_checkpoint, build_parser, main
+from mswpfuse.checkpoints import _load_model_checkpoint, _write_model_checkpoint
+from mswpfuse.cli import build_parser, main
 from mswpfuse.data import NWPScaler, build_fold_datasets, load_paper_settings
 from mswpfuse.initializer import HistoryInitializer
 from mswpfuse.model import AMENDMENT_PREFIXES, MSWPFuse, MSWPFuseBackbone
@@ -133,7 +134,7 @@ class TrainingContractTests(unittest.TestCase):
         with TemporaryDirectory(dir=Path(__file__).resolve().parent) as temporary:
             path = Path(temporary) / "existing.pt"
             path.write_bytes(b"existing")
-            with patch("mswpfuse.cli.build_fold_datasets") as build:
+            with patch("mswpfuse.training_commands.build_fold_datasets") as build:
                 with self.assertRaises(FileExistsError):
                     main(["train-initializer", "--fold", "summer", "--output", str(path)])
                 build.assert_not_called()

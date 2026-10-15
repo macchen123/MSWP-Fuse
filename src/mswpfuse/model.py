@@ -651,35 +651,29 @@ class MSWPFuseBackbone(nn.Module):
     def loaded_history_keys(self) -> tuple[str, ...]:
         return self._loaded_history_keys
 
-    def _pre_output(self, batch: Mapping[str, Tensor]) -> dict[str, Tensor]:
-        check_scalar_inputs(batch)
-        source_mask = make_joint_source_mask(
-            batch["nwp_availability"],
-            probability=self._source_dropout_probability,
-            training=self.training,
-        )
-        with fp32_cuda_context(batch["future_time"].device):
-            condition = self.conditioner(
-                batch["station_id"],
-                batch["resource_id"],
-                batch["future_time"].float(),
-            )
+    @property
+    def requires_history_initializer(self) -> bool:
+        return True
+
+    def _history_states(
+        self, batch: Mapping[str, Tensor], condition: Tensor
+    ) -> tuple[Tensor, Tensor]:
         lag = self.lag_history(
             batch["hist_power"],
             batch["hist_time"],
             condition,
         )
         memory = self.patch_history(batch["hist_power"], batch["hist_time"])
-        history = self.history_query(condition, memory)
+        return self.history_query(condition, memory), lag
 
-        scalar = batch["nwp"].reshape(-1, HORIZON, N_SOURCES, N_CHANNELS).float()
-        scalar = scalar * source_mask[:, None, :, None].to(scalar.dtype)
-        raw_scalar = inverse_standardize_scalar(
-            scalar,
-            self.nwp_mean.to(scalar),
-            self.nwp_std.to(scalar),
-            source_mask,
-        )
+    def _weather_states(
+        self,
+        batch: Mapping[str, Tensor],
+        scalar: Tensor,
+        raw_scalar: Tensor,
+        source_mask: Tensor,
+        condition: Tensor,
+    ) -> dict[str, Tensor]:
         disagreement = source_disagreement(scalar, source_mask)
         physics = scalar_physics_features(raw_scalar)
         physics = physics * source_mask[:, None, :, None].to(physics.dtype)
@@ -693,7 +687,32 @@ class MSWPFuseBackbone(nn.Module):
         )
         provider = self.scalar_provider(provider_inputs, condition)
         weather = self.provider_fusion(provider, source_mask, condition)
-        aligned_base_state = self.aligned_fusion(history, lag, weather, condition)
+        return {"provider_state": provider, "fused_weather": weather}
+
+    def _pre_output(self, batch: Mapping[str, Tensor]) -> dict[str, Tensor]:
+        check_scalar_inputs(batch)
+        source_mask = make_joint_source_mask(
+            batch["nwp_availability"],
+            probability=self._source_dropout_probability,
+            training=self.training,
+        )
+        with fp32_cuda_context(batch["future_time"].device):
+            condition = self.conditioner(
+                batch["station_id"],
+                batch["resource_id"],
+                batch["future_time"].float(),
+            )
+        history, lag = self._history_states(batch, condition)
+        scalar = batch["nwp"].reshape(-1, HORIZON, N_SOURCES, N_CHANNELS).float()
+        scalar = scalar * source_mask[:, None, :, None].to(scalar.dtype)
+        raw_scalar = inverse_standardize_scalar(
+            scalar,
+            self.nwp_mean.to(scalar),
+            self.nwp_std.to(scalar),
+            source_mask,
+        )
+        weather_states = self._weather_states(batch, scalar, raw_scalar, source_mask, condition)
+        aligned_base_state = self.aligned_fusion(history, lag, weather_states["fused_weather"], condition)
         if self.refiner is not None:
             refiner_state = self.refiner(aligned_base_state, condition)
         else:
@@ -704,24 +723,27 @@ class MSWPFuseBackbone(nn.Module):
             "source_mask": source_mask,
             "masked_scalar_nwp": scalar,
             "raw_scalar": raw_scalar,
-            "provider_state": provider,
-            "fused_weather": weather,
+            **weather_states,
             "aligned_base_state": aligned_base_state,
             "refiner_state": refiner_state,
             "base_state": refiner_state,
             "raw_base": raw_base,
         }
 
-    def forward(self, batch: Mapping[str, Tensor]) -> Tensor:
+    def forward_features(self, batch: Mapping[str, Tensor]) -> dict[str, Tensor]:
         states = self._pre_output(batch)
         prediction = smooth_nonnegative(states["raw_base"])
-        return apply_solar_darkness(
+        prediction = apply_solar_darkness(
             prediction,
             states["raw_scalar"],
             states["source_mask"],
             batch["resource_id"],
             threshold=float(self.daylight_threshold.item()),
         )
+        return {**states, "prediction": prediction}
+
+    def forward(self, batch: Mapping[str, Tensor]) -> Tensor:
+        return self.forward_features(batch)["prediction"]
 
 
 class MSWPFuse(MSWPFuseBackbone):
@@ -827,15 +849,7 @@ class MSWPFuse(MSWPFuseBackbone):
         )
 
     def forward_parent(self, batch: Mapping[str, Tensor]) -> Tensor:
-        states = self._pre_output(batch)
-        prediction = smooth_nonnegative(states["raw_base"])
-        return apply_solar_darkness(
-            prediction,
-            states["raw_scalar"],
-            states["source_mask"],
-            batch["resource_id"],
-            threshold=float(self.daylight_threshold.item()),
-        )
+        return super().forward_features(batch)["prediction"]
 
     def forward_features(self, batch: Mapping[str, Tensor]) -> dict[str, Tensor]:
         states = self._pre_output(batch)

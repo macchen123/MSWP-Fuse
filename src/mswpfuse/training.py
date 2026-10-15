@@ -317,13 +317,16 @@ def _set_learning_rates(optimizer: torch.optim.Optimizer, epoch: int, max_epochs
         group["lr"] = minimum + (base - minimum) * cosine
 
 
-def configure_selected_scope(model: MSWPFuse, settings: Mapping[str, Any]) -> list[dict[str, object]]:
-    if settings["trainable_scope"] != "amendment_plus_head":
-        raise ValueError("The public selected stage uses amendment_plus_head")
+def configure_selected_scope(model: MSWPFuseBackbone, settings: Mapping[str, Any]) -> list[dict[str, object]]:
+    scope = settings["trainable_scope"]
+    if scope not in ("amendment_plus_head", "head_only"):
+        raise ValueError("The public selected stage uses amendment_plus_head or head_only")
+    if scope == "head_only" and type(model) is not MSWPFuseBackbone:
+        raise ValueError("Head-only training requires the full backbone-only model, without SRATR or representation replacements")
     amendment: list[Tensor] = []
     head: list[Tensor] = []
     for name, parameter in model.named_parameters():
-        if name.startswith(AMENDMENT_PREFIXES):
+        if scope == "amendment_plus_head" and name.startswith(AMENDMENT_PREFIXES):
             parameter.requires_grad_(True)
             amendment.append(parameter)
         elif name.startswith("head."):
@@ -331,19 +334,20 @@ def configure_selected_scope(model: MSWPFuse, settings: Mapping[str, Any]) -> li
             head.append(parameter)
         else:
             parameter.requires_grad_(False)
-    if not amendment or not head:
+    if not head or (scope == "amendment_plus_head" and not amendment):
         raise RuntimeError("Selected training scope is empty")
     learning_rate = float(settings["learning_rate"])
     multiplier = float(settings["parent_lr_multiplier"])
     minimum = float(settings["minimum_lr"])
-    return [
-        {"params": amendment, "lr": learning_rate, "base_lr": learning_rate, "minimum_lr": minimum, "weight_decay": float(settings["weight_decay"])},
-        {"params": head, "lr": learning_rate * multiplier, "base_lr": learning_rate * multiplier, "minimum_lr": minimum * multiplier, "weight_decay": float(settings["weight_decay"])},
-    ]
+    groups = []
+    if amendment:
+        groups.append({"params": amendment, "lr": learning_rate, "base_lr": learning_rate, "minimum_lr": minimum, "weight_decay": float(settings["weight_decay"])})
+    groups.append({"params": head, "lr": learning_rate * multiplier, "base_lr": learning_rate * multiplier, "minimum_lr": minimum * multiplier, "weight_decay": float(settings["weight_decay"])})
+    return groups
 
 
 def _selected_loss(
-    model: MSWPFuse,
+    model: MSWPFuseBackbone,
     states: Mapping[str, Tensor],
     batch: Mapping[str, object],
     composite: CompositeForecastLoss,
@@ -358,6 +362,8 @@ def _selected_loss(
     target = target.float()
     mask = valid_mask(target, target_mask.bool())
     composite_value = composite(prediction.float(), target, station_ids, mask, model.station_delta_penalty())
+    if settings["trainable_scope"] == "head_only":
+        return composite_value
     inactive_logit = states["inactive_logit"]
     inactive_target = (target.detach() <= float(settings["activity_threshold"])).to(inactive_logit.dtype)
     bce = masked_mean(nn.functional.binary_cross_entropy_with_logits(inactive_logit, inactive_target, reduction="none"), mask)
@@ -391,7 +397,7 @@ def select_validation_row(rows: Sequence[Mapping[str, Any]], tolerance: float = 
 
 
 def train_selected(
-    model: MSWPFuse,
+    model: MSWPFuseBackbone,
     train_dataset: Dataset[Any],
     validation_dataset: Dataset[Any],
     settings: Mapping[str, Any],
@@ -489,7 +495,7 @@ def train_parent(
     device: torch.device,
 ) -> TrainingOutcome:
     """Fit the initialized backbone for the fixed 18-epoch schedule."""
-    if not model.loaded_history_keys:
+    if model.requires_history_initializer and not model.loaded_history_keys:
         raise ValueError("Backbone training requires the same-fold history initializer")
     seed = int(selected_settings["seed"])
     seed_mswpfuse(seed, device)
@@ -505,9 +511,10 @@ def train_parent(
     started = time.perf_counter()
     for epoch in range(1, max_epochs + 1):
         sampler.set_epoch(epoch)
-        for name, parameter in model.patch_history.named_parameters():
-            if name in model.loaded_history_keys:
-                parameter.requires_grad_(epoch > int(parent_settings["history_freeze_epochs"]))
+        if model.loaded_history_keys:
+            for name, parameter in model.patch_history.named_parameters():
+                if name in model.loaded_history_keys:
+                    parameter.requires_grad_(epoch > int(parent_settings["history_freeze_epochs"]))
         model.set_source_dropout(0.0 if epoch < int(parent_settings["source_dropout_start_epoch"]) else float(parent_settings["source_dropout_probability"]))
         if epoch <= warmup:
             for group in optimizer.param_groups:
